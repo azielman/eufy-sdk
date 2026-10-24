@@ -61,6 +61,7 @@ import {
   type TuyaDpInbound,
 } from "../core/contracts.js";
 import { noopLogger } from "../core/logger.js";
+import { StationUnreachableError } from "../core/contracts.js";
 import { PushClient } from "../transport/push/push-client.js";
 import { FcmRegistrar } from "../transport/push/fcm.js";
 import { MemoryFcmStore } from "../transport/push/store.js";
@@ -319,6 +320,15 @@ export class EufyMega extends EventEmitter {
   private readonly mqtt: MqttCommandRouter;
   /** Transport-side owner of the legacy Tuya REST command path for non-AIoT vacuums (G-series). */
   private readonly tuya: TuyaCommandRouter;
+  /**
+   * Devices whose P2P session could not be reached on a recent `ff09-*` command, with the time until which
+   * their `ff09-*` commands go straight to secure MQTT. Some Wi-Fi locks carry a `p2p_did` yet every lookup
+   * server answers it as not online (`fe`), while the vendor app still drives them over the account's secure
+   * MQTT channel; without this each command would wait out the full P2P connect timeout first.
+   */
+  private readonly ff09MqttFallbackUntil = new Map<string, number>();
+  /** How long a P2P-unreachable device keeps routing `ff09-*` commands over MQTT before P2P is tried again. */
+  private static readonly FF09_MQTT_FALLBACK_MS = 10 * 60 * 1000;
 
   private readonly tuyaDpRouter: TuyaDpRouter;
   /**
@@ -1240,6 +1250,36 @@ export class EufyMega extends EventEmitter {
    * relay candidates; T9000 retains compact SDP and relay-only candidates. A call doorbell's route serves
    * media only, and the RTC router refuses a command on it. Everything else is P2P.
    */
+  /**
+   * Whether an `ff09-*` command for a P2P-claimed device may fall back to secure MQTT: an eufy-cloud device
+   * with a product model, which the MQTT topic (`cmd/eufy_security/<pn>/<sn>/req`) needs.
+   */
+  private canFallBackToMqtt(dev: EufyDevice): boolean {
+    return dev.api === "mega" && typeof dev.model === "string" && dev.model.length > 0;
+  }
+
+  /**
+   * Send an `ff09-*` command over P2P, and over secure MQTT instead when the device's P2P session cannot be
+   * reached. A device that was unreachable keeps going straight to MQTT for {@link FF09_MQTT_FALLBACK_MS}.
+   * Only {@link StationUnreachableError} falls back: a session that connected and then refused is an answer,
+   * not an unreachable device, and is rethrown as is.
+   */
+  private async dispatchFf09WithMqttFallback(sn: string, cmd: Command): Promise<void> {
+    const until = this.ff09MqttFallbackUntil.get(sn);
+    if (until !== undefined && Date.now() < until) return this.mqtt.dispatchCommand(sn, cmd);
+    try {
+      await this.p2p.dispatchCommand(sn, cmd);
+      this.ff09MqttFallbackUntil.delete(sn);
+    } catch (err) {
+      if (!(err instanceof StationUnreachableError)) throw err;
+      this.opts.logger?.warn?.(
+        `[eufy] ${sn}: P2P unreachable for ${cmd.kind} (${err.message}); retrying over secure MQTT`,
+      );
+      this.ff09MqttFallbackUntil.set(sn, Date.now() + EufyMega.FF09_MQTT_FALLBACK_MS);
+      await this.mqtt.dispatchCommand(sn, cmd);
+    }
+  }
+
   private routeCommand(sn: string, cmd: Command): Promise<void> {
     if (
       cmd.kind === "ff09-actuate" ||
@@ -1248,7 +1288,11 @@ export class EufyMega extends EventEmitter {
       cmd.kind === "keyed-payload-actuate"
     ) {
       const dev = this.registry.require(sn);
-      if (P2PCommandRouter.claimsDevice(dev)) return this.p2p.dispatchCommand(sn, cmd);
+      if (P2PCommandRouter.claimsDevice(dev)) {
+        if (cmd.kind === "keyed-payload-actuate" || !this.canFallBackToMqtt(dev))
+          return this.p2p.dispatchCommand(sn, cmd);
+        return this.dispatchFf09WithMqttFallback(sn, cmd);
+      }
       if (MqttCommandRouter.claimsDevice(dev)) return this.mqtt.dispatchCommand(sn, cmd);
       throw new Error(`no transport stack claims device ${sn} for a ${cmd.kind} command`);
     }
