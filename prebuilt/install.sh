@@ -20,5 +20,5 @@ else
   echo "Installed fork build (fallback markers: $($D exec $C grep -c ff09MqttFallbackUntil "$F"))."
 fi
 echo "Restarting bridge add-on..."
-ha addons restart $SLUG >/dev/null 2>&1 || $D restart $C >/dev/null
+$D restart $C >/dev/null  # not "ha addons restart", which recreates the container and drops the swap
 echo "Done. Now press Lock / Unlock / Lock on lock.side_door, then send Claude the bridge log."
